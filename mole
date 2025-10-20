@@ -1,0 +1,363 @@
+#!/bin/bash
+
+# ERROR if $MOLE_RC isn't set
+if [ -z "$MOLE_RC" ]; then
+    echo "ERROR: No path to configuration file. Missing '$MOLE_RC'"
+    exit 1
+fi
+# create $MOLE_RC dir if it doesn't exist
+if [ ! -d "$(dirname "$MOLE_RC")" ]; then
+    mkdir -p "$(dirname "$MOLE_RC")"
+fi
+# create $MOLE_RC file if it doesn't exist
+if [ ! -f "$MOLE_RC" ]; then
+    touch "$MOLE_RC"
+fi
+# soruce $MOLE_RC variables
+source $MOLE_RC
+
+# set editor from $MOLE_RC
+if [ -n "$EDITOR" ]; then
+    editor="$EDITOR"
+elif [ -n "$VISUAL" ]; then
+    editor="$VISUAL"
+else
+    editor="vi"
+fi
+
+# function to print out mole script help
+print_help(){
+    echo "The following is the 'mole' script usage guide:"
+    echo "mole -h"
+    echo "mole [-g GROUP] FILE"
+    echo "mole [-m] [FILTERS] [DIRECTORY]"
+    echo "mole list [FILTERS] [DIRECTORY]"
+}
+
+# function to filter $MOLE_RC entries based on group
+check_group(){
+    dir_matches=$(echo "${dir_matches[@]}" | grep -E ,[^,]*$group[^,]*,)
+}
+
+# function to filter $MOLE_RC entries based on before and after date
+check_dates(){
+    if [ -n "$before_date" ]; then
+        before_date_obj="$(date -d "$before_date" "+%s")"
+        # convert to array to access each entry in the for loop
+        readarray -t match_arr <<<"$dir_matches"
+
+        # get date portion of entry, compare to 'before_date' option
+        for match in "${match_arr[@]}"; do
+            date_field=$(echo "$match" | cut -d "," -f 3-)
+            first_date=$(echo "$date_field" | cut -d "_" -f 1)
+            entry_date_obj=$(date -d "$first_date" +%s)
+            if [ "$entry_date_obj" -lt "$before_date_obj" ]; then
+                matched_entries+=("$match")
+            fi
+        done
+
+        # convert matched entries back to newline separated string
+        dir_matches=$(printf "%s\n" "${matched_entries[@]}")
+    fi
+
+    if [ -n "$after_date" ]; then
+        # reset array (since -b option comes before)
+        matched_entries=()
+        after_date_obj="$(date -d "$after_date" "+%s")"
+        readarray -t match_arr <<<"$dir_matches"
+        for match in "${match_arr[@]}"; do
+            date_field=$(echo "$match" | cut -d "," -f 3-)
+            last_date=$(echo "$date_field" | awk '{print $NF}' | cut -d "_" -f 1)
+            entry_date_obj=$(date -d "$last_date" +%s)
+            if [ "$entry_date_obj" -gt "$after_date_obj" ]; then
+                matched_entries+=("$match")
+            fi
+        done
+        dir_matches=$(printf "%s\n" "${matched_entries[@]}")
+    fi
+}
+# load the date and time when script was ran
+curr_date=$(date +'%Y-%m-%d_%H-%M-%S')
+
+# code for the secret-log option
+if [[ "$1" == "secret-log" ]]; then
+    # shift to ignore secret-log argument portion
+    shift 1
+    
+    # read options
+    while getopts "b:a:" opt; do
+        case $opt in
+            b)
+                before_date=$OPTARG
+                ;;
+            a)
+                after_date=$OPTARG
+                ;;
+            :)
+                echo "ERROR: Option '-$OPTARG' requires an argument."
+                print_help
+                exit 1
+                ;;
+            \?)
+                echo "ERROR: Unknown option '-$OPTARG'.">&2
+                print_help
+                exit 1
+                ;;
+        esac
+    done
+    # shift to ignore already read options
+    shift $((OPTIND-1))
+
+    # load args
+    args="$@"
+    # if args exist, save each as a directory path
+    if [ -n "$args" ]; then
+        for arg in "${args[@]}"; do
+            dir_path=$(realpath $arg)
+            dir_paths+=("$dir_path")
+        done
+        # match $MOLE_RC entries for every path in dir_paths
+        for path in "${dir_paths[@]}"; do
+            dir_matches+=("$(grep -E "^# $path/[^/]*," "$MOLE_RC")")
+        done
+    else
+        # if no args, load all entries
+        dir_matches+=$(grep -E "^# /" "$MOLE_RC")
+    fi
+
+    # filter based on -a -b options if present
+    check_dates
+
+    # if there are no matches left at this point, print error
+    if [ -z "$dir_matches" ]; then
+        echo "ERROR: No mathces in '$dir_paths' directory.">&2
+        print_help
+        exit 1
+    fi
+
+    user=$(whoami)
+    # convert to array to access each entry in the for loop
+    readarray -t match_arr <<<"$dir_matches"
+    for match in "${match_arr[@]}"; do
+        # cut entries to match desired secret-log file format
+        file_path=$(echo "$match" | cut -d "," -f 1 | cut -d " " -f 2-)
+        dates=$(echo "$match" | cut -d "," -f 3- | tr ' ' ';' | sed 's/;[^;]*$/\n/')
+        log_file+=("$file_path;$dates")
+    done
+    
+    # # convert back to newline separated string
+    log_lines=$(printf "%s\n" "${log_file[@]}")
+    # lexicographic sort
+    log_lines=$(echo "$log_lines" | sort -t ';' -k1)
+
+    log_path="/home/${user}/.mole"
+    log_name="log_${user}_${curr_date}.bz2"
+    # if .mole dir doesn't exist, create it
+    if [ ! -d "$log_path" ]; then
+        mkdir "$log_path"
+    fi
+    # create compressed secret-log file
+    printf "%s\n" "${log_lines[@]}" | bzip2 > "${log_path}/${log_name}"
+
+    exit 0
+fi
+
+# code for the list option
+if [[ "$1" == "list" ]]; then
+    # shift to ignore list argument portion
+    shift 1
+
+    # read options    
+    while getopts "g:b:a:" opt; do
+        case $opt in
+            g)
+                group=$OPTARG
+                ;;
+            b)
+                before_date=$OPTARG
+                ;;
+            a)
+                after_date=$OPTARG
+                ;;
+            :)
+                echo "ERROR: Option '-$OPTARG' requires an argument."
+                print_help
+                exit 1
+                ;;
+            \?)
+                echo "ERROR: Unknown option '-$OPTARG'.">&2
+                print_help
+                exit 1
+                ;;
+        esac
+    done
+    # shift to ignore already read options
+    shift $((OPTIND-1))
+    
+    # if there is no arg left, file_path is current dir
+    if [ -z "$1" ]; then
+        file_path=$(pwd)
+    # if there is an argument, file_path is first arg
+    else
+        file_path=$(realpath $1)
+    fi
+
+    # filter based on directory
+    dir_matches=$(grep -E "^# $file_path/[^/]*," "$MOLE_RC")
+    # filter based on -g option if present
+    check_group
+    # filter based on -a -b options if present
+    check_dates
+
+    # get 'file.ext' portion of each entry and save it to an array
+    while IFS= read -r line; do
+        file_name=$(basename "${line%%,*}")
+        file_arr+=("$file_name")
+    done <<< "$dir_matches"
+
+    # find the longest 'file.ext' for proper list formatting
+    indent_len=0
+    for string in "${file_arr[@]}"
+        do
+            if [ "${#string}" -gt "$indent_len" ]
+            then
+                indent_len="${#string}"
+            fi
+    done
+    # increase by 1 to properly format the longest file in list
+    (( indent_len++ ))
+
+    # convert to array to access each entry in the for loop
+    readarray -t match_arr <<<"$dir_matches"
+    for entry in "${match_arr[@]}"; do
+        # get the group portion of each entry and save it to an array
+        group=$(echo "$entry" | cut -d "," -f 2 | tr ' ' ',')
+        # if entry has no group, put -
+        if [ -z "$group" ]; then
+            group="-"
+        fi
+        group_arr+=("$group")
+    done
+
+    # array for proper list formatting
+    declare -A list_arr
+
+    # add file and group portions together into array
+    for i in "${!file_arr[@]}"; do
+        list_arr["${file_arr[$i]}"]="${group_arr[$i]}"
+    done
+
+    # print list
+    for key in "${!list_arr[@]}"; do
+        # list formatting based on longest filename
+        printf "%-${indent_len}s %s\n" "$key:" "${list_arr[$key]}"
+    done
+
+    exit 0 
+fi
+
+# code for file opening
+# read options
+while getopts ":hg:mb:a:" opt; do
+    case $opt in
+        h)
+            print_help
+            exit 0
+            ;;
+        g)
+            group=$OPTARG
+            ;;
+        m) 
+            m_flag=true
+            ;;
+        b)
+            before_date=$OPTARG
+            ;;
+        a)
+            after_date=$OPTARG
+            ;;
+        :)
+            echo "ERROR: Option '-$OPTARG' requires an argument."
+            print_help
+            exit 1;;
+        \?)
+            echo "ERROR: Unknown option '-$OPTARG'.">&2
+            print_help
+            exit 1;;
+
+    esac
+done
+# shift to ignore already read options
+shift $((OPTIND-1))
+
+# if there is no arg left, file_path is current dir
+if [ -z "$1" ]; then
+    file_path=$(pwd)
+# if there is an argument, file_path is first arg
+else
+    file_path=$(realpath $1)
+fi
+
+# if file_path is a directory, filter entries based on directory
+if [ -d "$file_path" ]; then
+    dir_matches=$(grep -E "^# $file_path/[^/]*," "$MOLE_RC")
+    # filter based on -g option if present
+    check_group
+    # filter based on -a -b options if present
+    check_dates
+
+    # if there are no matches left at this point, print error
+    if [ -z "$dir_matches" ]; then
+        echo "ERROR: No mathces in '$file_path' directory.">&2
+        print_help
+        exit 1
+    fi
+    # if -m option is set, select most opened file based on number of dates
+    if [ -n "$m_flag" ]; then
+        file_match=$(echo "$dir_matches" | awk -F ',' '{gsub(/ /,"",$3); print $1 "," $2 "," length($3)}' | sort -t ',' -k3nr) # | tail -n 1
+        file_path=${file_match#*# }
+        file_path=${file_path%%,*}
+    # if -m option isn't set, select last opened file
+    else
+        file_match=$(echo "$dir_matches" | tail -n 1)
+        file_path=${file_match#*# }
+        file_path=${file_path%%,*}
+    fi
+fi
+
+# if file is already in $MOLE_RC
+if grep -q "^# ${file_path}," "$MOLE_RC"; then
+    # load old info
+    old_entry=$(grep "^# ${file_path}," "$MOLE_RC")
+
+    # separate old info into groups and dates
+    IFS=',' read -ra old_info <<< "${old_entry#*# }"
+    old_groups="${old_info[1]}"
+    old_dates="${old_info[2]}"
+
+    # add new info
+    new_groups=($old_groups)
+    new_dates=($old_dates $curr_date)
+    # don't add the same group twice
+    if [[ ! " ${old_groups[*]} " =~ " ${group} " ]]; then
+        new_groups+=($group)
+    fi
+    # remove old entry
+    sed -i "\:^# ${file_path}:d" "$MOLE_RC"
+# if file is a new entry, load current info
+else
+    new_groups=($group)
+    new_dates=($curr_date)
+fi
+
+# format group portion
+groups=$(printf "%s " "${new_groups[@]}")
+groups="${groups% }"
+# format date portion
+dates=$(printf "%s " "${new_dates[@]}")
+
+# write info to $MOLE_RC
+echo "# $file_path,$groups,$dates" >> $MOLE_RC
+
+# open selected file
+exec "$editor" "$file_path"
